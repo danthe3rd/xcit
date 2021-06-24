@@ -18,6 +18,7 @@ from timm.models.layers import DropPath, trunc_normal_, to_2tuple
 
 
 class PositionalEncodingFourier(nn.Module):
+    # Let's not run this quantized
     """
     Positional encoding relying on a fourier kernel matching the one used in the
     "Attention is all of Need" paper. The implementation builds on DeTR code
@@ -31,9 +32,11 @@ class PositionalEncodingFourier(nn.Module):
         self.temperature = temperature
         self.hidden_dim = hidden_dim
         self.dim = dim
+        self._quant = torch.quantization.QuantStub()
+        self._dequant = torch.quantization.DeQuantStub()
 
     def forward(self, B, H, W):
-        mask = torch.zeros(B, H, W).bool().to(self.token_projection.weight.device)
+        mask = torch.zeros(B, H, W).bool() #.to(self.token_projection.weight.device)
         not_mask = ~mask
         y_embed = not_mask.cumsum(1, dtype=torch.float32)
         x_embed = not_mask.cumsum(2, dtype=torch.float32)
@@ -51,7 +54,7 @@ class PositionalEncodingFourier(nn.Module):
         pos_y = torch.stack((pos_y[:, :, :, 0::2].sin(),
                              pos_y[:, :, :, 1::2].cos()), dim=4).flatten(3)
         pos = torch.cat((pos_y, pos_x), dim=3).permute(0, 3, 1, 2)
-        pos = self.token_projection(pos)
+        pos = self.token_projection(self._quant(pos))
         return pos
 
 
@@ -61,7 +64,8 @@ def conv3x3(in_planes, out_planes, stride=1):
         nn.Conv2d(
             in_planes, out_planes, kernel_size=3, stride=stride, padding=1, bias=False
         ),
-        nn.SyncBatchNorm(out_planes)
+        nn.BatchNorm2d(out_planes),
+        # nn.SyncBatchNorm(out_planes),
     )
 
 
@@ -81,19 +85,19 @@ class ConvPatchEmbed(nn.Module):
         if patch_size[0] == 16:
             self.proj = torch.nn.Sequential(
                 conv3x3(3, embed_dim // 8, 2),
-                nn.GELU(),
+                nn.ReLU(),
                 conv3x3(embed_dim // 8, embed_dim // 4, 2),
-                nn.GELU(),
+                nn.ReLU(),
                 conv3x3(embed_dim // 4, embed_dim // 2, 2),
-                nn.GELU(),
+                nn.ReLU(),
                 conv3x3(embed_dim // 2, embed_dim, 2),
             )
         elif patch_size[0] == 8:
             self.proj = torch.nn.Sequential(
                 conv3x3(3, embed_dim // 4, 2),
-                nn.GELU(),
+                nn.ReLU(),
                 conv3x3(embed_dim // 4, embed_dim // 2, 2),
-                nn.GELU(),
+                nn.ReLU(),
                 conv3x3(embed_dim // 2, embed_dim, 2),
             )
         else:
@@ -115,7 +119,7 @@ class LPI(nn.Module):
     Implemented using 2 layers of separable 3x3 convolutions with GeLU and BatchNorm2d
     """
 
-    def __init__(self, in_features, hidden_features=None, out_features=None, act_layer=nn.GELU,
+    def __init__(self, in_features, hidden_features=None, out_features=None, act_layer=nn.ReLU,
                  drop=0., kernel_size=3):
         super().__init__()
         out_features = out_features or in_features
@@ -125,21 +129,28 @@ class LPI(nn.Module):
         self.conv1 = torch.nn.Conv2d(in_features, out_features, kernel_size=kernel_size,
                                      padding=padding, groups=out_features)
         self.act = act_layer()
-        self.bn = nn.SyncBatchNorm(in_features)
+        # self.bn = nn.SyncBatchNorm(in_features)
+        self.bn = nn.BatchNorm2d(in_features)
         self.conv2 = torch.nn.Conv2d(in_features, out_features, kernel_size=kernel_size,
                                      padding=padding, groups=out_features)
 
     def forward(self, x, H, W):
         B, N, C = x.shape
         x = x.permute(0, 2, 1).reshape(B, C, H, W)
+        # x = self.conv1(x)
+        # x = self.act(x)
+        # x = self.bn(x)
+        # x = self.conv2(x)
         x = self.conv1(x)
-        x = self.act(x)
         x = self.bn(x)
+        x = self.act(x)
         x = self.conv2(x)
         x = x.reshape(B, C, N).permute(0, 2, 1)
 
         return x
 
+    def fuse_model(self):
+        torch.quantization.fuse_modules(self, ['conv1', 'bn'], inplace=True)
 
 class ClassAttention(nn.Module):
     """Class Attention Layer as in CaiT https://arxiv.org/abs/2103.17239
@@ -155,6 +166,11 @@ class ClassAttention(nn.Module):
         self.attn_drop = nn.Dropout(attn_drop)
         self.proj = nn.Linear(dim, dim)
         self.proj_drop = nn.Dropout(proj_drop)
+        self.ff = torch.nn.quantized.FloatFunctional()
+        self.quant = torch.quantization.QuantStub()
+        self.dequantQ = torch.quantization.DeQuantStub()
+        self.dequantK = torch.quantization.DeQuantStub()
+        self.dequantV = torch.quantization.DeQuantStub()
 
     def forward(self, x):
         B, N, C = x.shape
@@ -162,14 +178,19 @@ class ClassAttention(nn.Module):
         qkv = qkv.permute(2, 0, 3, 1, 4)
         q, k, v = qkv[0], qkv[1], qkv[2]   # make torchscript happy (cannot use tensor as tuple)
 
-        qc = q[:, :, 0:1]   # CLS token
+        # TODO: Attention not quantized
+        k = self.dequantK(k)
+        v = self.dequantV(v)
+
+        qc = self.dequantQ(q[:, :, 0:1])   # CLS token
         attn_cls = (qc * k).sum(dim=-1) * self.scale
         attn_cls = attn_cls.softmax(dim=-1)
         attn_cls = self.attn_drop(attn_cls)
 
         cls_tkn = (attn_cls.unsqueeze(2) @ v).transpose(1, 2).reshape(B, 1, C)
+        cls_tkn = self.quant(cls_tkn)
         cls_tkn = self.proj(cls_tkn)
-        x = torch.cat([self.proj_drop(cls_tkn), x[:, 1:]], dim=1)
+        x = self.ff.cat([self.proj_drop(cls_tkn), x[:, 1:]], dim=1)
         return x
 
 
@@ -178,7 +199,7 @@ class ClassAttentionBlock(nn.Module):
     """
 
     def __init__(self, dim, num_heads, mlp_ratio=4., qkv_bias=False, qk_scale=None, drop=0.,
-                 attn_drop=0., drop_path=0., act_layer=nn.GELU, norm_layer=nn.LayerNorm, eta=None,
+                 attn_drop=0., drop_path=0., act_layer=nn.ReLU, norm_layer=nn.LayerNorm, eta=None,
                  tokens_norm=False):
         super().__init__()
         self.norm1 = norm_layer(dim)
@@ -202,9 +223,14 @@ class ClassAttentionBlock(nn.Module):
 
         # FIXME: A hack for models pre-trained with layernorm over all the tokens not just the CLS
         self.tokens_norm = tokens_norm
+        self.ff = torch.nn.quantized.FloatFunctional()
+        self.ff2 = torch.nn.quantized.FloatFunctional()
+        self.ff3 = torch.nn.quantized.FloatFunctional()
+        self.quant = torch.quantization.QuantStub()
+        self.quant2 = torch.quantization.QuantStub()
 
     def forward(self, x, H, W, mask=None):
-        x = x + self.drop_path(self.gamma1 * self.attn(self.norm1(x)))
+        x = self.ff.add(x, self.drop_path(self.ff.mul(self.quant(self.gamma1), self.attn(self.norm1(x)))))
         if self.tokens_norm:
             x = self.norm2(x)
         else:
@@ -212,9 +238,9 @@ class ClassAttentionBlock(nn.Module):
 
         x_res = x
         cls_token = x[:, 0:1]
-        cls_token = self.gamma2 * self.mlp(cls_token)
-        x = torch.cat([cls_token, x[:, 1:]], dim=1)
-        x = x_res + self.drop_path(x)
+        cls_token = self.ff2.mul(self.quant2(self.gamma2), self.mlp(cls_token))
+        x = self.ff3.cat([cls_token, x[:, 1:]], dim=1)
+        x = self.ff3.add(x_res, self.drop_path(x))
         return x
 
 
@@ -233,6 +259,10 @@ class XCA(nn.Module):
         self.attn_drop = nn.Dropout(attn_drop)
         self.proj = nn.Linear(dim, dim)
         self.proj_drop = nn.Dropout(proj_drop)
+        self.quant = torch.quantization.QuantStub()
+        self.dequantV = torch.quantization.DeQuantStub()
+        self.dequantQ = torch.quantization.DeQuantStub()
+        self.dequantK = torch.quantization.DeQuantStub()
 
     def forward(self, x):
         B, N, C = x.shape
@@ -244,6 +274,11 @@ class XCA(nn.Module):
         k = k.transpose(-2, -1)
         v = v.transpose(-2, -1)
 
+        # TODO: Attention is not quantized!!
+        q = self.dequantQ(q)
+        k = self.dequantK(k)
+        v = self.dequantV(v)
+
         q = torch.nn.functional.normalize(q, dim=-1)
         k = torch.nn.functional.normalize(k, dim=-1)
 
@@ -252,6 +287,7 @@ class XCA(nn.Module):
         attn = self.attn_drop(attn)
 
         x = (attn @ v).permute(0, 3, 1, 2).reshape(B, N, C)
+        x = self.quant(x)
         x = self.proj(x)
         x = self.proj_drop(x)
         return x
@@ -263,7 +299,7 @@ class XCA(nn.Module):
 
 class XCABlock(nn.Module):
     def __init__(self, dim, num_heads, mlp_ratio=4., qkv_bias=False, qk_scale=None, drop=0.,
-                 attn_drop=0., drop_path=0., act_layer=nn.GELU, norm_layer=nn.LayerNorm,
+                 attn_drop=0., drop_path=0., act_layer=nn.ReLU, norm_layer=nn.LayerNorm,
                  num_tokens=196, eta=None):
         super().__init__()
         self.norm1 = norm_layer(dim)
@@ -285,10 +321,18 @@ class XCABlock(nn.Module):
         self.gamma2 = nn.Parameter(eta * torch.ones(dim), requires_grad=True)
         self.gamma3 = nn.Parameter(eta * torch.ones(dim), requires_grad=True)
 
+
+        self.ff1 = torch.nn.quantized.FloatFunctional()
+        self.ff2 = torch.nn.quantized.FloatFunctional()
+        self.ff3 = torch.nn.quantized.FloatFunctional()
+        self.q1 = torch.quantization.QuantStub()
+        self.q2 = torch.quantization.QuantStub()
+        self.q3 = torch.quantization.QuantStub()
+
     def forward(self, x, H, W):
-        x = x + self.drop_path(self.gamma1 * self.attn(self.norm1(x)))
-        x = x + self.drop_path(self.gamma3 * self.local_mp(self.norm3(x), H, W))
-        x = x + self.drop_path(self.gamma2 * self.mlp(self.norm2(x)))
+        x = self.ff1.add(x, self.drop_path(self.ff1.mul(self.q1(self.gamma1), self.attn(self.norm1(x)))))
+        x = self.ff2.add(x, self.drop_path(self.ff2.mul(self.q2(self.gamma3), self.local_mp(self.norm3(x), H, W))))
+        x = self.ff3.add(x, self.drop_path(self.ff3.mul(self.q3(self.gamma2), self.mlp(self.norm2(x)))))
         return x
 
 
@@ -360,6 +404,8 @@ class XCiT(nn.Module):
         # Classifier head
         trunc_normal_(self.cls_token, std=.02)
         self.apply(self._init_weights)
+        self.ff = torch.nn.quantized.FloatFunctional()
+        self.quant = torch.quantization.QuantStub()
 
     def _init_weights(self, m):
         if isinstance(m, nn.Linear):
@@ -381,7 +427,7 @@ class XCiT(nn.Module):
 
         if self.use_pos:
             pos_encoding = self.pos_embeder(B, Hp, Wp).reshape(B, -1, x.shape[1]).permute(0, 2, 1)
-            x = x + pos_encoding
+            x = self.ff.add(x, pos_encoding)
 
         x = self.pos_drop(x)
 
@@ -389,7 +435,8 @@ class XCiT(nn.Module):
             x = blk(x, Hp, Wp)
 
         cls_tokens = self.cls_token.expand(B, -1, -1)
-        x = torch.cat((cls_tokens, x), dim=1)
+        cls_tokens = self.quant(cls_tokens)
+        x = self.ff.cat((cls_tokens, x), dim=1)
 
         for blk in self.cls_attn_blocks:
             x = blk(x, Hp, Wp)
