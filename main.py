@@ -261,6 +261,7 @@ def main(args):
         drop_path_rate=args.drop_path,
         drop_block_rate=None
     )
+    model = torch.nn.SyncBatchNorm.convert_sync_batchnorm(model)
 
     if args.pretrained:
         if args.pretrained.startswith('https'):
